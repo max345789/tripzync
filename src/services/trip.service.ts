@@ -27,6 +27,8 @@ const ANCHOR_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const PLACES_CACHE_TTL_MS = 1000 * 60 * 20;
 const OVERPASS_LOOKUP_TIMEOUT_MS = 4500;
 const NOMINATIM_LOOKUP_TIMEOUT_MS = 3000;
+const DB_TRANSACTION_MAX_WAIT_MS = 10_000;
+const DB_TRANSACTION_TIMEOUT_MS = 20_000;
 
 const PLACE_SEARCH_TERMS_BY_BUDGET: Record<BudgetTier, string[]> = {
   low: ["park", "museum", "market", "cafe", "viewpoint"],
@@ -851,46 +853,52 @@ class TripService {
   async generateTrip(input: GenerateTripRequest, userId: string): Promise<TripDTO> {
     const itinerary = await buildItinerary(input.destination, input.days, input.budget);
 
-    const createdTrip = await prisma.$transaction(async (tx) => {
-      const user = await tx.user.findUnique({
-        where: { id: userId },
-        select: { id: true },
-      });
+    const createdTrip = await prisma.$transaction(
+      async (tx) => {
+        const user = await tx.user.findUnique({
+          where: { id: userId },
+          select: { id: true },
+        });
 
-      if (!user) {
-        throw new AppError(401, "UNAUTHORIZED", "Authenticated user does not exist.");
-      }
+        if (!user) {
+          throw new AppError(401, "UNAUTHORIZED", "Authenticated user does not exist.");
+        }
 
-      const trip = await tx.trip.create({
-        data: {
-          destination: input.destination,
-          days: input.days,
-          budget: input.budget,
-          userId,
-          itineraryDays: {
-            create: itinerary.map((day) => ({
-              dayNumber: day.dayNumber,
-              activities: {
-                create: day.activities.map((activity, index) => ({
-                  time: activity.time,
-                  title: activity.title,
-                  description: activity.description,
-                  latitude: activity.latitude,
-                  longitude: activity.longitude,
-                  sortOrder: index,
-                })),
-              },
-            })),
+        const trip = await tx.trip.create({
+          data: {
+            destination: input.destination,
+            days: input.days,
+            budget: input.budget,
+            userId,
+            itineraryDays: {
+              create: itinerary.map((day) => ({
+                dayNumber: day.dayNumber,
+                activities: {
+                  create: day.activities.map((activity, index) => ({
+                    time: activity.time,
+                    title: activity.title,
+                    description: activity.description,
+                    latitude: activity.latitude,
+                    longitude: activity.longitude,
+                    sortOrder: index,
+                  })),
+                },
+              })),
+            },
           },
-        },
-        select: { id: true },
-      });
+          select: { id: true },
+        });
 
-      return tx.trip.findUniqueOrThrow({
-        where: { id: trip.id },
-        include: tripInclude,
-      });
-    });
+        return tx.trip.findUniqueOrThrow({
+          where: { id: trip.id },
+          include: tripInclude,
+        });
+      },
+      {
+        maxWait: DB_TRANSACTION_MAX_WAIT_MS,
+        timeout: DB_TRANSACTION_TIMEOUT_MS,
+      }
+    );
 
     return mapTripResponse(createdTrip);
   }
@@ -934,58 +942,64 @@ class TripService {
   }
 
   async updateTrip(tripId: string, payload: UpdateTripRequest, userId: string): Promise<TripDTO> {
-    const result = await prisma.$transaction(async (tx) => {
-      const existing = await tx.trip.findFirst({
-        where: {
-          id: tripId,
-          userId,
-        },
-        select: {
-          id: true,
-          destination: true,
-          days: true,
-          budget: true,
-        },
-      });
-
-      if (!existing) {
-        throw new AppError(404, "NOT_FOUND", "Trip not found.");
-      }
-
-      const destination = payload.destination ?? existing.destination;
-      const days = payload.days ?? existing.days;
-      const budget = payload.budget ?? (existing.budget as BudgetTier);
-      const itinerary = await buildItinerary(destination, days, budget);
-
-      await tx.itineraryDay.deleteMany({
-        where: { tripId: existing.id },
-      });
-
-      return tx.trip.update({
-        where: { id: existing.id },
-        data: {
-          destination,
-          days,
-          budget,
-          itineraryDays: {
-            create: itinerary.map((day) => ({
-              dayNumber: day.dayNumber,
-              activities: {
-                create: day.activities.map((activity, index) => ({
-                  time: activity.time,
-                  title: activity.title,
-                  description: activity.description,
-                  latitude: activity.latitude,
-                  longitude: activity.longitude,
-                  sortOrder: index,
-                })),
-              },
-            })),
+    const result = await prisma.$transaction(
+      async (tx) => {
+        const existing = await tx.trip.findFirst({
+          where: {
+            id: tripId,
+            userId,
           },
-        },
-        include: tripInclude,
-      });
-    });
+          select: {
+            id: true,
+            destination: true,
+            days: true,
+            budget: true,
+          },
+        });
+
+        if (!existing) {
+          throw new AppError(404, "NOT_FOUND", "Trip not found.");
+        }
+
+        const destination = payload.destination ?? existing.destination;
+        const days = payload.days ?? existing.days;
+        const budget = payload.budget ?? (existing.budget as BudgetTier);
+        const itinerary = await buildItinerary(destination, days, budget);
+
+        await tx.itineraryDay.deleteMany({
+          where: { tripId: existing.id },
+        });
+
+        return tx.trip.update({
+          where: { id: existing.id },
+          data: {
+            destination,
+            days,
+            budget,
+            itineraryDays: {
+              create: itinerary.map((day) => ({
+                dayNumber: day.dayNumber,
+                activities: {
+                  create: day.activities.map((activity, index) => ({
+                    time: activity.time,
+                    title: activity.title,
+                    description: activity.description,
+                    latitude: activity.latitude,
+                    longitude: activity.longitude,
+                    sortOrder: index,
+                  })),
+                },
+              })),
+            },
+          },
+          include: tripInclude,
+        });
+      },
+      {
+        maxWait: DB_TRANSACTION_MAX_WAIT_MS,
+        timeout: DB_TRANSACTION_TIMEOUT_MS,
+      }
+    );
 
     return mapTripResponse(result);
   }
@@ -1059,8 +1073,8 @@ class TripService {
         });
       },
       {
-        maxWait: 10_000,
-        timeout: 20_000,
+        maxWait: DB_TRANSACTION_MAX_WAIT_MS,
+        timeout: DB_TRANSACTION_TIMEOUT_MS,
       }
     );
 
