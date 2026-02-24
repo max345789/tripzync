@@ -1,10 +1,11 @@
-import { LoginRequest, RegisterRequest } from "../types/auth";
+import { LoginRequest, RegisterRequest, SocialLoginRequest, SocialProvider } from "../types/auth";
 import { AppError } from "../utils/app-error";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_MIN_LENGTH = 8;
 const PASSWORD_MAX_LENGTH = 72;
 const NAME_MAX_LENGTH = 80;
+const SOCIAL_ALLOWED_PROVIDERS: SocialProvider[] = ["google", "apple", "phone"];
 
 function assertObject(payload: unknown, context: string): Record<string, unknown> {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -94,5 +95,54 @@ export function validateLoginRequest(payload: unknown): LoginRequest {
   return {
     email: parseEmail(body.email),
     password: parsePassword(body.password),
+  };
+}
+
+function parseProvider(raw: unknown): SocialProvider {
+  if (typeof raw !== "string") {
+    throw new AppError(400, "VALIDATION_ERROR", "provider is required.");
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!SOCIAL_ALLOWED_PROVIDERS.includes(normalized as SocialProvider)) {
+    throw new AppError(
+      400,
+      "VALIDATION_ERROR",
+      `provider must be one of: ${SOCIAL_ALLOWED_PROVIDERS.join(", ")}.`
+    );
+  }
+  return normalized as SocialProvider;
+}
+
+export function validateSocialLoginRequest(payload: unknown): SocialLoginRequest {
+  const body = assertObject(payload, "Request body");
+  assertAllowedKeys(body, ["provider", "idToken", "email", "name", "phoneNumber"], "Request body");
+
+  const provider = parseProvider(body.provider);
+
+  if (typeof body.idToken !== "string" || !body.idToken.trim()) {
+    throw new AppError(400, "VALIDATION_ERROR", "idToken is required.");
+  }
+
+  const email = body.email ? parseEmail(body.email) : undefined;
+  const name = parseOptionalName(body.name);
+  const phoneNumber =
+    body.phoneNumber === undefined || body.phoneNumber === null || body.phoneNumber === ""
+      ? undefined
+      : typeof body.phoneNumber === "string"
+        ? body.phoneNumber.trim()
+        : (() => {
+            throw new AppError(400, "VALIDATION_ERROR", "phoneNumber must be a string.");
+          })();
+
+  if (provider !== "phone" && !email) {
+    throw new AppError(400, "VALIDATION_ERROR", "email is required for non-phone providers.");
+  }
+
+  return {
+    provider,
+    idToken: body.idToken.trim(),
+    email,
+    name,
+    phoneNumber,
   };
 }

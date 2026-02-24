@@ -23,3 +23,13 @@ export type AuthResponse = {
   expiresIn: string;
   user: AuthUserDTO;
 };
+
+export type SocialProvider = "google" | "apple" | "phone";
+
+export type SocialLoginRequest = {
+  provider: SocialProvider;
+  idToken: string;
+  email?: string;
+  name?: string;
+  phoneNumber?: string;
+};

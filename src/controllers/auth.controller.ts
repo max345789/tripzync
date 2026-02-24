@@ -3,7 +3,11 @@ import { authService } from "../services/auth.service";
 import { asyncHandler } from "../utils/async-handler";
 import { sendSuccess } from "../utils/api-response";
 import { AppError } from "../utils/app-error";
-import { validateLoginRequest, validateRegisterRequest } from "../validators/auth.validator";
+import {
+  validateLoginRequest,
+  validateRegisterRequest,
+  validateSocialLoginRequest,
+} from "../validators/auth.validator";
 
 function authUserId(req: Request): string {
   if (!req.auth?.userId) {
@@ -31,4 +35,11 @@ export const meController = asyncHandler(async (req: Request, res: Response) => 
   const user = await authService.me(authUserId(req));
 
   return sendSuccess(res, user);
+});
+
+export const socialLoginController = asyncHandler(async (req: Request, res: Response) => {
+  const payload = validateSocialLoginRequest(req.body);
+  const result = await authService.socialLogin(payload);
+
+  return sendSuccess(res, result);
 });

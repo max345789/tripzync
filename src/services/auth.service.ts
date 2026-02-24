@@ -3,8 +3,17 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 import { prisma } from "../db/prisma";
-import { AuthResponse, AuthUserDTO, LoginRequest, RegisterRequest } from "../types/auth";
+import {
+  AuthResponse,
+  AuthUserDTO,
+  LoginRequest,
+  RegisterRequest,
+  SocialLoginRequest,
+  SocialProvider,
+} from "../types/auth";
 import { AppError } from "../utils/app-error";
+import admin from "firebase-admin";
+import { logger } from "../utils/logger";
 
 const SALT_ROUNDS = 12;
 
@@ -32,6 +41,16 @@ function buildAuthResponse(user: User): AuthResponse {
     expiresIn: env.jwtExpiresIn,
     user: mapUser(user),
   };
+}
+
+function initFirebase(): void {
+  if (admin.apps.length > 0) return;
+  try {
+    admin.initializeApp();
+  } catch (error) {
+    logger.error("FIREBASE_INIT_FAILED", error);
+    throw new AppError(500, "INTERNAL_ERROR", "Firebase initialization failed.");
+  }
 }
 
 class AuthService {
@@ -82,6 +101,58 @@ class AuthService {
     }
 
     return mapUser(user);
+  }
+
+  private async verifyFirebaseToken(request: SocialLoginRequest) {
+    initFirebase();
+    try {
+      const decoded = await admin.auth().verifyIdToken(request.idToken);
+      return decoded;
+    } catch (error) {
+      logger.error("FIREBASE_TOKEN_VERIFY_FAILED", error);
+      throw new AppError(401, "INVALID_TOKEN", "Unable to verify identity token.");
+    }
+  }
+
+  private assertProviderConsistency(provider: SocialProvider, decoded: admin.auth.DecodedIdToken) {
+    if (provider === "phone" && !decoded.phone_number) {
+      throw new AppError(400, "VALIDATION_ERROR", "Phone provider requires phone_number.");
+    }
+    if (provider !== "phone" && !decoded.email) {
+      throw new AppError(400, "VALIDATION_ERROR", "Email is required for this provider.");
+    }
+  }
+
+  async socialLogin(input: SocialLoginRequest): Promise<AuthResponse> {
+    const decoded = await this.verifyFirebaseToken(input);
+    this.assertProviderConsistency(input.provider, decoded);
+
+    const email = input.email ?? decoded.email?.toLowerCase();
+    const phoneNumber = input.phoneNumber ?? decoded.phone_number;
+    const name = input.name ?? decoded.name;
+
+    const uniqueIdentity = email ?? phoneNumber;
+    if (!uniqueIdentity) {
+      throw new AppError(400, "VALIDATION_ERROR", "Email or phone number required.");
+    }
+
+    const derivedEmail = email ?? `phone-${phoneNumber}@autouser.tripzync`;
+
+    const user = await prisma.user.upsert({
+      where: { email: derivedEmail },
+      update: {
+        name: name ?? undefined,
+        phone: phoneNumber ?? undefined,
+      },
+      create: {
+        email: derivedEmail,
+        name: name ?? null,
+        passwordHash: "", // not used for social
+        phone: phoneNumber ?? null,
+      },
+    });
+
+    return buildAuthResponse(user);
   }
 }
 
