@@ -46,6 +46,20 @@ function buildAuthResponse(user: User): AuthResponse {
 function initFirebase(): void {
   if (admin.apps.length > 0) return;
   try {
+    if (env.firebaseServiceAccountJson) {
+      const serviceAccount = JSON.parse(env.firebaseServiceAccountJson);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId: env.firebaseProjectId ?? serviceAccount.project_id,
+      });
+      return;
+    }
+
+    if (env.firebaseProjectId) {
+      admin.initializeApp({ projectId: env.firebaseProjectId });
+      return;
+    }
+
     admin.initializeApp();
   } catch (error) {
     logger.error("FIREBASE_INIT_FAILED", error);

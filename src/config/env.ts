@@ -92,4 +92,6 @@ export const env = {
   openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
   openaiTimeoutMs: parsePositiveInteger(process.env.OPENAI_TIMEOUT_MS, 11_000, "OPENAI_TIMEOUT_MS"),
   tripzyncApiKey: process.env.TRIPZYNC_API_KEY?.trim() || undefined,
+  firebaseProjectId: process.env.FIREBASE_PROJECT_ID?.trim() || undefined,
+  firebaseServiceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() || undefined,
 } as const;
