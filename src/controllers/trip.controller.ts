@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { sendSuccess } from "../utils/api-response";
 import { asyncHandler } from "../utils/async-handler";
 import {
+  validateExploreQuery,
   validateGenerateTripRequest,
   validateListTripsQuery,
   validateRegenerateTripRequest,
@@ -42,6 +43,13 @@ export const listTripsController = asyncHandler(async (req: Request, res: Respon
     limit: result.limit,
     offset: result.offset,
   });
+});
+
+export const exploreController = asyncHandler(async (req: Request, res: Response) => {
+  const query = validateExploreQuery(req.query);
+  const spots = await tripService.listExploreSpots(query, authUserId(req));
+
+  return sendSuccess(res, spots);
 });
 
 export const deleteTripController = asyncHandler(async (req: Request, res: Response) => {

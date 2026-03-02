@@ -1,11 +1,17 @@
-import { LoginRequest, RegisterRequest, SocialLoginRequest, SocialProvider } from "../types/auth";
+import {
+  LoginRequest,
+  RefreshTokenRequest,
+  RegisterRequest,
+  SocialLoginRequest,
+  SocialProvider,
+} from "../types/auth";
 import { AppError } from "../utils/app-error";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_MIN_LENGTH = 8;
 const PASSWORD_MAX_LENGTH = 72;
 const NAME_MAX_LENGTH = 80;
-const SOCIAL_ALLOWED_PROVIDERS: SocialProvider[] = ["google", "apple", "phone"];
+const SOCIAL_ALLOWED_PROVIDERS: SocialProvider[] = ["google", "apple"];
 
 function assertObject(payload: unknown, context: string): Record<string, unknown> {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -115,7 +121,7 @@ function parseProvider(raw: unknown): SocialProvider {
 
 export function validateSocialLoginRequest(payload: unknown): SocialLoginRequest {
   const body = assertObject(payload, "Request body");
-  assertAllowedKeys(body, ["provider", "idToken", "email", "name", "phoneNumber"], "Request body");
+  assertAllowedKeys(body, ["provider", "idToken", "email", "name"], "Request body");
 
   const provider = parseProvider(body.provider);
 
@@ -125,24 +131,24 @@ export function validateSocialLoginRequest(payload: unknown): SocialLoginRequest
 
   const email = body.email ? parseEmail(body.email) : undefined;
   const name = parseOptionalName(body.name);
-  const phoneNumber =
-    body.phoneNumber === undefined || body.phoneNumber === null || body.phoneNumber === ""
-      ? undefined
-      : typeof body.phoneNumber === "string"
-        ? body.phoneNumber.trim()
-        : (() => {
-            throw new AppError(400, "VALIDATION_ERROR", "phoneNumber must be a string.");
-          })();
-
-  if (provider !== "phone" && !email) {
-    throw new AppError(400, "VALIDATION_ERROR", "email is required for non-phone providers.");
-  }
 
   return {
     provider,
     idToken: body.idToken.trim(),
     email,
     name,
-    phoneNumber,
+  };
+}
+
+export function validateRefreshTokenRequest(payload: unknown): RefreshTokenRequest {
+  const body = assertObject(payload, "Request body");
+  assertAllowedKeys(body, ["refreshToken"], "Request body");
+
+  if (typeof body.refreshToken !== "string" || !body.refreshToken.trim()) {
+    throw new AppError(400, "VALIDATION_ERROR", "refreshToken is required.");
+  }
+
+  return {
+    refreshToken: body.refreshToken.trim(),
   };
 }

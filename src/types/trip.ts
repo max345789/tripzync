@@ -3,11 +3,13 @@ export const BUDGET_TIERS = ["low", "moderate", "luxury"] as const;
 export type BudgetTier = (typeof BUDGET_TIERS)[number];
 
 export type ActivityTime = "Morning" | "Afternoon" | "Evening";
+export type TravelMode = "walk" | "transit" | "drive";
 
 export type GenerateTripRequest = {
   destination: string;
   days: number;
   budget: BudgetTier;
+  startCity?: string;
 };
 
 export type RegenerateTripRequest = {
@@ -19,11 +21,17 @@ export type UpdateTripRequest = {
   destination?: string;
   days?: number;
   budget?: BudgetTier;
+  startCity?: string;
 };
 
 export type ListTripsQuery = {
   limit: number;
   offset: number;
+};
+
+export type ExploreQuery = {
+  limit: number;
+  q?: string;
 };
 
 export type ActivityDTO = {
@@ -32,6 +40,10 @@ export type ActivityDTO = {
   description: string;
   latitude: number;
   longitude: number;
+  durationMinutes: number;
+  travelToNextMinutes?: number;
+  travelToNextKm?: number;
+  travelMode?: TravelMode;
 };
 
 export type ItineraryDayDTO = {
@@ -45,6 +57,9 @@ export type TripDTO = {
   days: number;
   budget: BudgetTier;
   userId: string;
+  startCity: string;
+  startLatitude?: number;
+  startLongitude?: number;
   createdAt: string;
   updatedAt: string;
   itinerary: ItineraryDayDTO[];
@@ -60,4 +75,14 @@ export type TripListResponse = {
 export type DeleteTripResponse = {
   id: string;
   deleted: true;
+};
+
+export type ExploreSpotDTO = {
+  id: string;
+  title: string;
+  subtitle: string;
+  location: string;
+  latitude: number;
+  longitude: number;
+  source: "trip_history" | "fallback";
 };

@@ -19,17 +19,22 @@ export type AuthUserDTO = {
 
 export type AuthResponse = {
   accessToken: string;
+  refreshToken: string;
   tokenType: "Bearer";
   expiresIn: string;
+  refreshExpiresIn: string;
   user: AuthUserDTO;
 };
 
-export type SocialProvider = "google" | "apple" | "phone";
+export type SocialProvider = "google" | "apple";
 
 export type SocialLoginRequest = {
   provider: SocialProvider;
   idToken: string;
   email?: string;
   name?: string;
-  phoneNumber?: string;
+};
+
+export type RefreshTokenRequest = {
+  refreshToken: string;
 };

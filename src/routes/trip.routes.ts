@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   deleteTripController,
+  exploreController,
   generateTripController,
   getTripByIdController,
   listTripsController,
@@ -20,6 +21,7 @@ const tripGenerationLimiter = createRateLimitMiddleware({
 
 router.use(requireAuth);
 router.post("/generate-trip", tripGenerationLimiter, generateTripController);
+router.get("/explore", exploreController);
 router.get("/trip/:id", getTripByIdController);
 router.get("/trips", listTripsController);
 router.patch("/trip/:id", updateTripController);

@@ -13,16 +13,25 @@ model User {
   phone        String?  @unique
   passwordHash String
   name         String?
+  socialProvider        String?
+  socialSubject         String?
+  refreshTokenHash      String?
+  refreshTokenExpiresAt DateTime?
   trips        Trip[]
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  @@unique([socialProvider, socialSubject])
   @@index([createdAt])
+  @@index([refreshTokenExpiresAt])
 }
 
 model Trip {
   id            String         @id @default(cuid())
   destination   String
+  startCity     String
+  startLatitude Float?
+  startLongitude Float?
   days          Int
   budget        String
   userId        String
@@ -34,6 +43,7 @@ model Trip {
   @@index([userId, createdAt])
   @@index([createdAt])
   @@index([destination])
+  @@index([startCity])
 }
 
 model ItineraryDay {
@@ -56,6 +66,10 @@ model Activity {
   description    String
   latitude       Float
   longitude      Float
+  durationMinutes Int
+  travelToNextMinutes Int?
+  travelToNextKm  Float?
+  travelMode      String?
   sortOrder      Int
 
   @@index([itineraryDayId, sortOrder])

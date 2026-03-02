@@ -64,11 +64,40 @@ function parseOptionalSecret(value: string | undefined): string | undefined {
   return normalized ? normalized : undefined;
 }
 
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value || value.trim() === "") return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+
+  throw new Error("Invalid boolean value. Use true/false.");
+}
+
 const nodeEnv = parseNodeEnv(process.env.NODE_ENV);
 const jwtSecret = required("JWT_SECRET");
 
 if (jwtSecret.length < 16) {
   throw new Error("JWT_SECRET must be at least 16 characters.");
+}
+
+const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET?.trim() || `${jwtSecret}-refresh`;
+if (jwtRefreshSecret.length < 16) {
+  throw new Error("JWT_REFRESH_SECRET must be at least 16 characters.");
+}
+
+const socialAuthEnabled = parseBoolean(process.env.SOCIAL_AUTH_ENABLED, true);
+const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim() || undefined;
+const appleClientId = process.env.APPLE_CLIENT_ID?.trim() || undefined;
+
+if (nodeEnv === "production" && socialAuthEnabled) {
+  if (!googleClientId) {
+    throw new Error("GOOGLE_CLIENT_ID is required in production when SOCIAL_AUTH_ENABLED=true.");
+  }
+
+  if (!appleClientId) {
+    throw new Error("APPLE_CLIENT_ID is required in production when SOCIAL_AUTH_ENABLED=true.");
+  }
 }
 
 export const env = {
@@ -78,6 +107,8 @@ export const env = {
   corsOrigins: parseCorsOrigins(process.env.CORS_ORIGIN, nodeEnv),
   jwtSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN?.trim() || "7d",
+  jwtRefreshSecret,
+  jwtRefreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN?.trim() || "30d",
   tripGenerationRateLimitMax: parsePositiveInteger(
     process.env.TRIP_GENERATION_RATE_LIMIT_MAX,
     15,
@@ -88,10 +119,16 @@ export const env = {
     60_000,
     "TRIP_GENERATION_RATE_LIMIT_WINDOW_MS"
   ),
+  tripGenerationTimeoutMs: parsePositiveInteger(
+    process.env.TRIP_GENERATION_TIMEOUT_MS,
+    9_000,
+    "TRIP_GENERATION_TIMEOUT_MS"
+  ),
+  socialAuthEnabled,
+  googleClientId,
+  appleClientId,
   openaiApiKey: parseOptionalSecret(process.env.OPENAI_API_KEY),
   openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
   openaiTimeoutMs: parsePositiveInteger(process.env.OPENAI_TIMEOUT_MS, 11_000, "OPENAI_TIMEOUT_MS"),
   tripzyncApiKey: process.env.TRIPZYNC_API_KEY?.trim() || undefined,
-  firebaseProjectId: process.env.FIREBASE_PROJECT_ID?.trim() || undefined,
-  firebaseServiceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() || undefined,
 } as const;

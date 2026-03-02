@@ -5,6 +5,7 @@ import { sendSuccess } from "../utils/api-response";
 import { AppError } from "../utils/app-error";
 import {
   validateLoginRequest,
+  validateRefreshTokenRequest,
   validateRegisterRequest,
   validateSocialLoginRequest,
 } from "../validators/auth.validator";
@@ -42,4 +43,17 @@ export const socialLoginController = asyncHandler(async (req: Request, res: Resp
   const result = await authService.socialLogin(payload);
 
   return sendSuccess(res, result);
+});
+
+export const refreshController = asyncHandler(async (req: Request, res: Response) => {
+  const payload = validateRefreshTokenRequest(req.body);
+  const result = await authService.refresh(payload);
+
+  return sendSuccess(res, result);
+});
+
+export const logoutController = asyncHandler(async (req: Request, res: Response) => {
+  await authService.logout(authUserId(req));
+
+  return sendSuccess(res, { loggedOut: true });
 });

@@ -1,5 +1,7 @@
 import { User } from "@prisma/client";
 import bcrypt from "bcryptjs";
+import { createHash } from "crypto";
+import { createRemoteJWKSet, JWTPayload, jwtVerify } from "jose";
 import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 import { prisma } from "../db/prisma";
@@ -7,15 +9,21 @@ import {
   AuthResponse,
   AuthUserDTO,
   LoginRequest,
+  RefreshTokenRequest,
   RegisterRequest,
   SocialLoginRequest,
-  SocialProvider,
 } from "../types/auth";
 import { AppError } from "../utils/app-error";
-import admin from "firebase-admin";
-import { logger } from "../utils/logger";
 
 const SALT_ROUNDS = 12;
+const GOOGLE_JWKS = createRemoteJWKSet(new URL("https://www.googleapis.com/oauth2/v3/certs"));
+const APPLE_JWKS = createRemoteJWKSet(new URL("https://appleid.apple.com/auth/keys"));
+
+type VerifiedSocialIdentity = {
+  subject: string;
+  email?: string;
+  name?: string;
+};
 
 function mapUser(user: User): AuthUserDTO {
   return {
@@ -34,36 +42,126 @@ function signAccessToken(user: Pick<User, "id" | "email">): string {
   } as jwt.SignOptions);
 }
 
-function buildAuthResponse(user: User): AuthResponse {
+function signRefreshToken(user: Pick<User, "id" | "email">): string {
+  return jwt.sign({ email: user.email, type: "refresh" }, env.jwtRefreshSecret, {
+    subject: user.id,
+    expiresIn: env.jwtRefreshExpiresIn as jwt.SignOptions["expiresIn"],
+  } as jwt.SignOptions);
+}
+
+function hashRefreshToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function extractExpiry(token: string, secret: string): Date {
+  const decoded = jwt.verify(token, secret) as jwt.JwtPayload;
+  if (!decoded.exp) {
+    throw new AppError(500, "INTERNAL_ERROR", "Token expiry is missing.");
+  }
+  return new Date(decoded.exp * 1000);
+}
+
+async function buildAuthResponse(user: User): Promise<AuthResponse> {
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+  const refreshTokenHash = hashRefreshToken(refreshToken);
+  const refreshTokenExpiresAt = extractExpiry(refreshToken, env.jwtRefreshSecret);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      refreshTokenHash,
+      refreshTokenExpiresAt,
+    },
+  });
+
   return {
-    accessToken: signAccessToken(user),
+    accessToken,
+    refreshToken,
     tokenType: "Bearer",
     expiresIn: env.jwtExpiresIn,
+    refreshExpiresIn: env.jwtRefreshExpiresIn,
     user: mapUser(user),
   };
 }
 
-function initFirebase(): void {
-  if (admin.apps.length > 0) return;
+function claimString(payload: JWTPayload, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function sanitizeSubject(subject: string): string {
+  return subject
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "_")
+    .slice(0, 80);
+}
+
+async function verifyGoogleToken(idToken: string): Promise<VerifiedSocialIdentity> {
   try {
-    if (env.firebaseServiceAccountJson) {
-      const serviceAccount = JSON.parse(env.firebaseServiceAccountJson);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        projectId: env.firebaseProjectId ?? serviceAccount.project_id,
-      });
-      return;
+    const options: Parameters<typeof jwtVerify>[2] = {
+      issuer: ["https://accounts.google.com", "accounts.google.com"],
+    };
+
+    if (env.googleClientId) {
+      options.audience = env.googleClientId;
     }
 
-    if (env.firebaseProjectId) {
-      admin.initializeApp({ projectId: env.firebaseProjectId });
-      return;
+    const { payload } = await jwtVerify(idToken, GOOGLE_JWKS, options);
+    const subject = claimString(payload, "sub");
+
+    if (!subject) {
+      throw new AppError(401, "INVALID_TOKEN", "Google token subject is missing.");
     }
 
-    admin.initializeApp();
+    const email = claimString(payload, "email")?.toLowerCase();
+    const emailVerified = payload.email_verified;
+    if (email && emailVerified === false) {
+      throw new AppError(401, "INVALID_TOKEN", "Google email is not verified.");
+    }
+
+    return {
+      subject,
+      email,
+      name: claimString(payload, "name"),
+    };
   } catch (error) {
-    logger.error("FIREBASE_INIT_FAILED", error);
-    throw new AppError(500, "INTERNAL_ERROR", "Firebase initialization failed.");
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    throw new AppError(401, "INVALID_TOKEN", "Unable to verify Google identity token.");
+  }
+}
+
+async function verifyAppleToken(idToken: string): Promise<VerifiedSocialIdentity> {
+  try {
+    const options: Parameters<typeof jwtVerify>[2] = {
+      issuer: "https://appleid.apple.com",
+    };
+
+    if (env.appleClientId) {
+      options.audience = env.appleClientId;
+    }
+
+    const { payload } = await jwtVerify(idToken, APPLE_JWKS, options);
+    const subject = claimString(payload, "sub");
+
+    if (!subject) {
+      throw new AppError(401, "INVALID_TOKEN", "Apple token subject is missing.");
+    }
+
+    return {
+      subject,
+      email: claimString(payload, "email")?.toLowerCase(),
+      name: claimString(payload, "name"),
+    };
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    throw new AppError(401, "INVALID_TOKEN", "Unable to verify Apple identity token.");
   }
 }
 
@@ -96,7 +194,7 @@ class AuthService {
       where: { email: input.email },
     });
 
-    if (!user) {
+    if (!user || !user.passwordHash) {
       throw new AppError(401, "INVALID_CREDENTIALS", "Invalid email or password.");
     }
 
@@ -117,56 +215,105 @@ class AuthService {
     return mapUser(user);
   }
 
-  private async verifyFirebaseToken(request: SocialLoginRequest) {
-    initFirebase();
-    try {
-      const decoded = await admin.auth().verifyIdToken(request.idToken);
-      return decoded;
-    } catch (error) {
-      logger.error("FIREBASE_TOKEN_VERIFY_FAILED", error);
-      throw new AppError(401, "INVALID_TOKEN", "Unable to verify identity token.");
-    }
-  }
-
-  private assertProviderConsistency(provider: SocialProvider, decoded: admin.auth.DecodedIdToken) {
-    if (provider === "phone" && !decoded.phone_number) {
-      throw new AppError(400, "VALIDATION_ERROR", "Phone provider requires phone_number.");
-    }
-    if (provider !== "phone" && !decoded.email) {
-      throw new AppError(400, "VALIDATION_ERROR", "Email is required for this provider.");
-    }
-  }
-
   async socialLogin(input: SocialLoginRequest): Promise<AuthResponse> {
-    const decoded = await this.verifyFirebaseToken(input);
-    this.assertProviderConsistency(input.provider, decoded);
-
-    const email = input.email ?? decoded.email?.toLowerCase();
-    const phoneNumber = input.phoneNumber ?? decoded.phone_number;
-    const name = input.name ?? decoded.name;
-
-    const uniqueIdentity = email ?? phoneNumber;
-    if (!uniqueIdentity) {
-      throw new AppError(400, "VALIDATION_ERROR", "Email or phone number required.");
+    if (!env.socialAuthEnabled) {
+      throw new AppError(503, "SOCIAL_AUTH_DISABLED", "Social sign-in is disabled.");
     }
 
-    const derivedEmail = email ?? `phone-${phoneNumber}@autouser.tripzync`;
+    const identity =
+      input.provider === "google"
+        ? await verifyGoogleToken(input.idToken)
+        : await verifyAppleToken(input.idToken);
 
-    const user = await prisma.user.upsert({
-      where: { email: derivedEmail },
-      update: {
-        name: name ?? undefined,
-        phone: phoneNumber ?? undefined,
-      },
-      create: {
-        email: derivedEmail,
-        name: name ?? null,
-        passwordHash: "", // not used for social
-        phone: phoneNumber ?? null,
+    const socialProvider = input.provider;
+    const socialSubject = identity.subject;
+    const aliasEmail = `${socialProvider}-${sanitizeSubject(socialSubject)}@social.tripzync.local`;
+    const requestedEmail = input.email?.toLowerCase() ?? identity.email;
+    const name = input.name ?? identity.name;
+
+    let user = await prisma.user.findUnique({
+      where: {
+        socialProvider_socialSubject: {
+          socialProvider,
+          socialSubject,
+        },
       },
     });
 
+    if (!user && requestedEmail) {
+      user = await prisma.user.findUnique({
+        where: { email: requestedEmail },
+      });
+    }
+
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          email: requestedEmail ?? aliasEmail,
+          name: name ?? null,
+          passwordHash: "",
+          socialProvider,
+          socialSubject,
+        },
+      });
+
+      return buildAuthResponse(user);
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        socialProvider,
+        socialSubject,
+        name: name ?? user.name,
+      },
+    });
+
+    return buildAuthResponse(updatedUser);
+  }
+
+  async refresh(input: RefreshTokenRequest): Promise<AuthResponse> {
+    let decoded: jwt.JwtPayload;
+    try {
+      decoded = jwt.verify(input.refreshToken, env.jwtRefreshSecret) as jwt.JwtPayload;
+    } catch {
+      throw new AppError(401, "UNAUTHORIZED", "Invalid or expired refresh token.");
+    }
+
+    const userId = typeof decoded.sub === "string" ? decoded.sub : "";
+    if (!userId) {
+      throw new AppError(401, "UNAUTHORIZED", "Invalid refresh token.");
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new AppError(401, "UNAUTHORIZED", "Account not found.");
+    }
+
+    if (!user.refreshTokenHash || !user.refreshTokenExpiresAt) {
+      throw new AppError(401, "UNAUTHORIZED", "Refresh session not found.");
+    }
+
+    if (user.refreshTokenExpiresAt.getTime() <= Date.now()) {
+      throw new AppError(401, "UNAUTHORIZED", "Refresh token expired.");
+    }
+
+    const providedHash = hashRefreshToken(input.refreshToken);
+    if (providedHash !== user.refreshTokenHash) {
+      throw new AppError(401, "UNAUTHORIZED", "Refresh token is invalid.");
+    }
+
     return buildAuthResponse(user);
+  }
+
+  async logout(userId: string): Promise<void> {
+    await prisma.user.updateMany({
+      where: { id: userId },
+      data: {
+        refreshTokenHash: null,
+        refreshTokenExpiresAt: null,
+      },
+    });
   }
 }
 

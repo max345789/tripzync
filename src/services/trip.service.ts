@@ -5,14 +5,19 @@ import {
   ActivityTime,
   BudgetTier,
   DeleteTripResponse,
+  ExploreQuery,
+  ExploreSpotDTO,
   GenerateTripRequest,
   ListTripsQuery,
   RegenerateTripRequest,
   TripDTO,
   TripListResponse,
+  TravelMode,
   UpdateTripRequest,
 } from "../types/trip";
+import { env } from "../config/env";
 import { AppError } from "../utils/app-error";
+import { logger } from "../utils/logger";
 import { generateAISuggestedItinerary } from "./ai-itinerary.service";
 
 const ACTIVITY_ORDER: ActivityTime[] = ["Morning", "Afternoon", "Evening"];
@@ -29,6 +34,8 @@ const OVERPASS_LOOKUP_TIMEOUT_MS = 4500;
 const NOMINATIM_LOOKUP_TIMEOUT_MS = 3000;
 const DB_TRANSACTION_MAX_WAIT_MS = 10_000;
 const DB_TRANSACTION_TIMEOUT_MS = 20_000;
+const GENERATION_HARD_TIMEOUT_MS = 8_500;
+const AI_PHASE_TIMEOUT_MS = 3_000;
 
 const PLACE_SEARCH_TERMS_BY_BUDGET: Record<BudgetTier, string[]> = {
   low: ["park", "museum", "market", "cafe", "viewpoint"],
@@ -40,6 +47,18 @@ type Anchor = {
   latitude: number;
   longitude: number;
   seed: number;
+};
+
+type GeneratedActivity = ActivityDTO & {
+  durationMinutes: number;
+  travelToNextMinutes?: number;
+  travelToNextKm?: number;
+  travelMode?: TravelMode;
+};
+
+type GeneratedDay = {
+  dayNumber: number;
+  activities: GeneratedActivity[];
 };
 
 type NearbyPlace = {
@@ -700,7 +719,7 @@ function buildActivity(
   budget: BudgetTier,
   anchor: { latitude: number; longitude: number; seed: number },
   place: NearbyPlace | null
-): ActivityDTO {
+): GeneratedActivity {
   const catalog = BUDGET_ACTIVITY_LIBRARY[budget][time];
   const template = catalog[(dayNumber + slotIndex) % catalog.length];
   const coords = place
@@ -715,7 +734,77 @@ function buildActivity(
       : `${template.description} Destination: ${destination}. Day ${dayNumber}.`,
     latitude: coords.latitude,
     longitude: coords.longitude,
+    durationMinutes: 90,
   };
+}
+
+function haversineKm(fromLat: number, fromLng: number, toLat: number, toLng: number): number {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const earthRadiusKm = 6371;
+  const dLat = toRadians(toLat - fromLat);
+  const dLng = toRadians(toLng - fromLng);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRadians(fromLat)) * Math.cos(toRadians(toLat)) * Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
+function estimateTravel(distanceKm: number, budget: BudgetTier): { minutes: number; mode: TravelMode } {
+  if (distanceKm < 1.2) {
+    return { minutes: Math.max(8, Math.round(distanceKm * 14)), mode: "walk" };
+  }
+
+  if (budget === "luxury") {
+    return { minutes: Math.max(10, Math.min(70, Math.round((distanceKm / 26) * 60))), mode: "drive" };
+  }
+
+  return { minutes: Math.max(12, Math.min(85, Math.round((distanceKm / 20) * 60))), mode: "transit" };
+}
+
+function baseDurationMinutes(budget: BudgetTier, time: ActivityTime): number {
+  if (budget === "low") {
+    if (time === "Morning") return 95;
+    if (time === "Afternoon") return 110;
+    return 100;
+  }
+
+  if (budget === "luxury") {
+    if (time === "Morning") return 130;
+    if (time === "Afternoon") return 155;
+    return 125;
+  }
+
+  if (time === "Morning") return 110;
+  if (time === "Afternoon") return 135;
+  return 115;
+}
+
+function enrichDayActivitiesWithTiming(
+  activities: GeneratedActivity[],
+  budget: BudgetTier
+): GeneratedActivity[] {
+  return activities.map((activity, index) => {
+    const next = activities[index + 1];
+    const enriched: GeneratedActivity = {
+      ...activity,
+      durationMinutes: baseDurationMinutes(budget, activity.time),
+    };
+
+    if (!next) {
+      return enriched;
+    }
+
+    const distanceKm = haversineKm(activity.latitude, activity.longitude, next.latitude, next.longitude);
+    const travel = estimateTravel(distanceKm, budget);
+
+    return {
+      ...enriched,
+      travelToNextMinutes: travel.minutes,
+      travelToNextKm: Math.round(distanceKm * 10) / 10,
+      travelMode: travel.mode,
+    };
+  });
 }
 
 function normalizeCardText(value: string | null | undefined, fallback: string, maxLength: number): string {
@@ -742,18 +831,19 @@ function buildDeterministicItinerary(
   budget: BudgetTier,
   anchor: Anchor,
   nearbyPlaces: NearbyPlace[]
-) {
+): GeneratedDay[] {
   const usedPlaceIds = new Set<string>();
 
   return Array.from({ length: days }, (_, index) => {
     const dayNumber = index + 1;
+    const baseActivities = ACTIVITY_ORDER.map((time, slotIndex) => {
+      const place = pickPlaceForSlot(nearbyPlaces, usedPlaceIds, time, dayNumber, slotIndex, anchor.seed);
+      return buildActivity(destination, dayNumber, time, slotIndex, budget, anchor, place);
+    });
 
     return {
       dayNumber,
-      activities: ACTIVITY_ORDER.map((time, slotIndex) => {
-        const place = pickPlaceForSlot(nearbyPlaces, usedPlaceIds, time, dayNumber, slotIndex, anchor.seed);
-        return buildActivity(destination, dayNumber, time, slotIndex, budget, anchor, place);
-      }),
+      activities: enrichDayActivitiesWithTiming(baseActivities, budget),
     };
   });
 }
@@ -764,7 +854,7 @@ async function buildAIEnhancedItinerary(
   budget: BudgetTier,
   anchor: Anchor,
   nearbyPlaces: NearbyPlace[]
-) {
+): Promise<GeneratedDay[] | null> {
   const aiSuggestion = await generateAISuggestedItinerary(destination, days, budget, nearbyPlaces);
   if (!aiSuggestion) {
     return null;
@@ -778,53 +868,110 @@ async function buildAIEnhancedItinerary(
     const dayNumber = index + 1;
     const daySuggestion = suggestionsByDay.get(dayNumber);
     const suggestionByTime = new Map(daySuggestion?.activities.map((activity) => [activity.time, activity]));
+    const baseActivities = ACTIVITY_ORDER.map((time, slotIndex) => {
+      const slotSuggestion = suggestionByTime.get(time);
+      const suggestedPlace =
+        slotSuggestion?.placeId && !usedPlaceIds.has(slotSuggestion.placeId)
+          ? placeById.get(slotSuggestion.placeId) ?? null
+          : null;
+
+      const place =
+        suggestedPlace ??
+        pickPlaceForSlot(nearbyPlaces, usedPlaceIds, time, dayNumber, slotIndex, anchor.seed);
+
+      if (place) {
+        usedPlaceIds.add(place.id);
+      }
+
+      const fallbackActivity = buildActivity(destination, dayNumber, time, slotIndex, budget, anchor, place);
+      const title = normalizeCardText(slotSuggestion?.title, fallbackActivity.title, 84);
+      const description = normalizeCardText(slotSuggestion?.description, fallbackActivity.description, 220);
+      const hiddenGemPrefix = slotSuggestion?.hiddenGem ? "Hidden gem: " : "";
+
+      return {
+        ...fallbackActivity,
+        title,
+        description: normalizeCardText(
+          hiddenGemPrefix ? `${hiddenGemPrefix}${description}` : description,
+          fallbackActivity.description,
+          220
+        ),
+      };
+    });
 
     return {
       dayNumber,
-      activities: ACTIVITY_ORDER.map((time, slotIndex) => {
-        const slotSuggestion = suggestionByTime.get(time);
-        const suggestedPlace =
-          slotSuggestion?.placeId && !usedPlaceIds.has(slotSuggestion.placeId)
-            ? placeById.get(slotSuggestion.placeId) ?? null
-            : null;
-
-        const place =
-          suggestedPlace ??
-          pickPlaceForSlot(nearbyPlaces, usedPlaceIds, time, dayNumber, slotIndex, anchor.seed);
-
-        if (place) {
-          usedPlaceIds.add(place.id);
-        }
-
-        const fallbackActivity = buildActivity(destination, dayNumber, time, slotIndex, budget, anchor, place);
-        const title = normalizeCardText(slotSuggestion?.title, fallbackActivity.title, 84);
-        const description = normalizeCardText(slotSuggestion?.description, fallbackActivity.description, 220);
-        const hiddenGemPrefix = slotSuggestion?.hiddenGem ? "Hidden gem: " : "";
-
-        return {
-          ...fallbackActivity,
-          title,
-          description: normalizeCardText(
-            hiddenGemPrefix ? `${hiddenGemPrefix}${description}` : description,
-            fallbackActivity.description,
-            220
-          ),
-        };
-      }),
+      activities: enrichDayActivitiesWithTiming(baseActivities, budget),
     };
   });
 }
 
-async function buildItinerary(destination: string, days: number, budget: BudgetTier) {
-  const anchor = await resolveAnchorFromDestination(destination);
-  const nearbyPlaces = await fetchNearbyPlaces(anchor, destination, budget);
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise<T | null>((resolve) => {
+    const timeout = setTimeout(() => resolve(null), timeoutMs);
 
-  const aiItinerary = await buildAIEnhancedItinerary(destination, days, budget, anchor, nearbyPlaces);
-  if (aiItinerary) {
-    return aiItinerary;
+    promise
+      .then((value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      })
+      .catch(() => {
+        clearTimeout(timeout);
+        resolve(null);
+      });
+  });
+}
+
+async function buildItinerary(destination: string, days: number, budget: BudgetTier) {
+  const start = Date.now();
+  const hardLimit = Math.max(4_000, env.tripGenerationTimeoutMs ?? GENERATION_HARD_TIMEOUT_MS);
+  const fallbackAnchor = resolveAnchor(destination);
+  const fallbackItinerary = buildDeterministicItinerary(destination, days, budget, fallbackAnchor, []);
+  const hardTimeoutPromise = new Promise<null>((resolve) => {
+    setTimeout(() => resolve(null), hardLimit);
+  });
+
+  const generationPromise = (async () => {
+    const anchor = (await withTimeout(resolveAnchorFromDestination(destination), 2_500)) ?? fallbackAnchor;
+    const nearbyPlaces = (await withTimeout(fetchNearbyPlaces(anchor, destination, budget), 3_500)) ?? [];
+    const aiItinerary = await withTimeout(
+      buildAIEnhancedItinerary(destination, days, budget, anchor, nearbyPlaces),
+      AI_PHASE_TIMEOUT_MS
+    );
+
+    return {
+      anchor,
+      itinerary: aiItinerary ?? buildDeterministicItinerary(destination, days, budget, anchor, nearbyPlaces),
+    };
+  })();
+
+  const result = await Promise.race([generationPromise, hardTimeoutPromise]);
+  if (!result) {
+    logger.warn("TRIP_GENERATION_TIMEOUT_FALLBACK", {
+      destination,
+      days,
+      budget,
+      elapsedMs: Date.now() - start,
+    });
+    return {
+      anchor: fallbackAnchor,
+      itinerary: fallbackItinerary,
+      fallbackUsed: true,
+    };
   }
 
-  return buildDeterministicItinerary(destination, days, budget, anchor, nearbyPlaces);
+  logger.info("TRIP_GENERATION_COMPLETED", {
+    destination,
+    days,
+    budget,
+    elapsedMs: Date.now() - start,
+  });
+
+  return {
+    anchor: result.anchor,
+    itinerary: result.itinerary,
+    fallbackUsed: false,
+  };
 }
 
 function mapTripResponse(trip: Prisma.TripGetPayload<{ include: typeof tripInclude }>): TripDTO {
@@ -834,6 +981,9 @@ function mapTripResponse(trip: Prisma.TripGetPayload<{ include: typeof tripInclu
     days: trip.days,
     budget: trip.budget as BudgetTier,
     userId: trip.userId,
+    startCity: trip.startCity,
+    startLatitude: trip.startLatitude ?? undefined,
+    startLongitude: trip.startLongitude ?? undefined,
     createdAt: trip.createdAt.toISOString(),
     updatedAt: trip.updatedAt.toISOString(),
     itinerary: trip.itineraryDays.map((day) => ({
@@ -844,14 +994,39 @@ function mapTripResponse(trip: Prisma.TripGetPayload<{ include: typeof tripInclu
         description: activity.description,
         latitude: activity.latitude,
         longitude: activity.longitude,
+        durationMinutes: activity.durationMinutes,
+        travelToNextMinutes: activity.travelToNextMinutes ?? undefined,
+        travelToNextKm: activity.travelToNextKm ?? undefined,
+        travelMode: (activity.travelMode as TravelMode | null) ?? undefined,
       })),
     })),
   };
 }
 
+function toTitleCase(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+const EXPLORE_FALLBACKS: Array<{ title: string; subtitle: string; location: string }> = [
+  { title: "Hidden City Walk", subtitle: "Hidden Gems", location: "Old Town" },
+  { title: "Local Flavor Route", subtitle: "Food", location: "Market District" },
+  { title: "Sunset Viewpoint", subtitle: "Nature", location: "Hilltop" },
+  { title: "Arts and Stories", subtitle: "Culture", location: "Museum Quarter" },
+  { title: "Night Lights Loop", subtitle: "Evening", location: "City Center" },
+];
+
 class TripService {
   async generateTrip(input: GenerateTripRequest, userId: string): Promise<TripDTO> {
-    const itinerary = await buildItinerary(input.destination, input.days, input.budget);
+    const startTime = Date.now();
+    const startCity = (input.startCity ?? input.destination).trim();
+    const { itinerary, fallbackUsed } = await buildItinerary(input.destination, input.days, input.budget);
+    const startAnchor =
+      (await withTimeout(resolveAnchorFromDestination(startCity), 1_800)) ?? resolveAnchor(startCity);
 
     const createdTrip = await prisma.$transaction(
       async (tx) => {
@@ -867,6 +1042,9 @@ class TripService {
         const trip = await tx.trip.create({
           data: {
             destination: input.destination,
+            startCity,
+            startLatitude: startAnchor.latitude,
+            startLongitude: startAnchor.longitude,
             days: input.days,
             budget: input.budget,
             userId,
@@ -880,6 +1058,10 @@ class TripService {
                     description: activity.description,
                     latitude: activity.latitude,
                     longitude: activity.longitude,
+                    durationMinutes: activity.durationMinutes,
+                    travelToNextMinutes: activity.travelToNextMinutes,
+                    travelToNextKm: activity.travelToNextKm,
+                    travelMode: activity.travelMode,
                     sortOrder: index,
                   })),
                 },
@@ -899,6 +1081,13 @@ class TripService {
         timeout: DB_TRANSACTION_TIMEOUT_MS,
       }
     );
+
+    logger.info("TRIP_GENERATE_PERSISTED", {
+      tripId: createdTrip.id,
+      userId,
+      elapsedMs: Date.now() - startTime,
+      fallbackUsed,
+    });
 
     return mapTripResponse(createdTrip);
   }
@@ -941,7 +1130,78 @@ class TripService {
     };
   }
 
+  async listExploreSpots(query: ExploreQuery, userId: string): Promise<ExploreSpotDTO[]> {
+    const trips = await prisma.trip.findMany({
+      where: { userId },
+      include: tripInclude,
+      orderBy: { createdAt: "desc" },
+      take: 30,
+    });
+
+    const search = query.q?.trim().toLowerCase();
+    const spots: ExploreSpotDTO[] = [];
+    const seen = new Set<string>();
+
+    for (const trip of trips) {
+      for (const day of trip.itineraryDays) {
+        for (const activity of day.activities) {
+          const key = `${activity.title.toLowerCase()}-${activity.latitude.toFixed(4)}-${activity.longitude.toFixed(4)}`;
+          if (seen.has(key)) {
+            continue;
+          }
+
+          const title = toTitleCase(activity.title);
+          const location = toTitleCase(trip.destination);
+          const searchable = `${title} ${location} ${activity.description}`.toLowerCase();
+          if (search && !searchable.includes(search)) {
+            continue;
+          }
+
+          seen.add(key);
+          spots.push({
+            id: key,
+            title,
+            subtitle: activity.time,
+            location,
+            latitude: activity.latitude,
+            longitude: activity.longitude,
+            source: "trip_history",
+          });
+
+          if (spots.length >= query.limit) {
+            return spots;
+          }
+        }
+      }
+    }
+
+    let fallbackIndex = 0;
+    while (spots.length < query.limit && fallbackIndex < EXPLORE_FALLBACKS.length) {
+      const fallback = EXPLORE_FALLBACKS[fallbackIndex];
+      fallbackIndex += 1;
+
+      const anchor = await resolveAnchorFromDestination(fallback.location);
+      const searchable = `${fallback.title} ${fallback.subtitle} ${fallback.location}`.toLowerCase();
+      if (search && !searchable.includes(search)) {
+        continue;
+      }
+
+      spots.push({
+        id: `fallback-${fallbackIndex}`,
+        title: fallback.title,
+        subtitle: fallback.subtitle,
+        location: fallback.location,
+        latitude: anchor.latitude,
+        longitude: anchor.longitude,
+        source: "fallback",
+      });
+    }
+
+    return spots;
+  }
+
   async updateTrip(tripId: string, payload: UpdateTripRequest, userId: string): Promise<TripDTO> {
+    const requestStartedAt = Date.now();
     const result = await prisma.$transaction(
       async (tx) => {
         const existing = await tx.trip.findFirst({
@@ -954,6 +1214,7 @@ class TripService {
             destination: true,
             days: true,
             budget: true,
+            startCity: true,
           },
         });
 
@@ -964,7 +1225,10 @@ class TripService {
         const destination = payload.destination ?? existing.destination;
         const days = payload.days ?? existing.days;
         const budget = payload.budget ?? (existing.budget as BudgetTier);
-        const itinerary = await buildItinerary(destination, days, budget);
+        const startCity = (payload.startCity ?? existing.startCity).trim();
+        const { itinerary } = await buildItinerary(destination, days, budget);
+        const startAnchor =
+          (await withTimeout(resolveAnchorFromDestination(startCity), 1_800)) ?? resolveAnchor(startCity);
 
         await tx.itineraryDay.deleteMany({
           where: { tripId: existing.id },
@@ -974,6 +1238,9 @@ class TripService {
           where: { id: existing.id },
           data: {
             destination,
+            startCity,
+            startLatitude: startAnchor.latitude,
+            startLongitude: startAnchor.longitude,
             days,
             budget,
             itineraryDays: {
@@ -986,6 +1253,10 @@ class TripService {
                     description: activity.description,
                     latitude: activity.latitude,
                     longitude: activity.longitude,
+                    durationMinutes: activity.durationMinutes,
+                    travelToNextMinutes: activity.travelToNextMinutes,
+                    travelToNextKm: activity.travelToNextKm,
+                    travelMode: activity.travelMode,
                     sortOrder: index,
                   })),
                 },
@@ -1000,6 +1271,12 @@ class TripService {
         timeout: DB_TRANSACTION_TIMEOUT_MS,
       }
     );
+
+    logger.info("TRIP_UPDATE_PERSISTED", {
+      tripId,
+      userId,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
 
     return mapTripResponse(result);
   }
@@ -1023,6 +1300,7 @@ class TripService {
   }
 
   async regenerateTrip(tripId: string, payload: RegenerateTripRequest, userId: string): Promise<TripDTO> {
+    const requestStartedAt = Date.now();
     const existing = await prisma.trip.findFirst({
       where: {
         id: tripId,
@@ -1033,6 +1311,7 @@ class TripService {
         destination: true,
         days: true,
         budget: true,
+        startCity: true,
       },
     });
 
@@ -1042,7 +1321,10 @@ class TripService {
 
     const days = payload.days ?? existing.days;
     const budget = payload.budget ?? (existing.budget as BudgetTier);
-    const itinerary = await buildItinerary(existing.destination, days, budget);
+    const { itinerary } = await buildItinerary(existing.destination, days, budget);
+    const startAnchor =
+      (await withTimeout(resolveAnchorFromDestination(existing.startCity), 1_800)) ??
+      resolveAnchor(existing.startCity);
 
     const result = await prisma.$transaction(
       async (tx) => {
@@ -1053,6 +1335,8 @@ class TripService {
           data: {
             days,
             budget,
+            startLatitude: startAnchor.latitude,
+            startLongitude: startAnchor.longitude,
             itineraryDays: {
               create: itinerary.map((day) => ({
                 dayNumber: day.dayNumber,
@@ -1063,6 +1347,10 @@ class TripService {
                     description: activity.description,
                     latitude: activity.latitude,
                     longitude: activity.longitude,
+                    durationMinutes: activity.durationMinutes,
+                    travelToNextMinutes: activity.travelToNextMinutes,
+                    travelToNextKm: activity.travelToNextKm,
+                    travelMode: activity.travelMode,
                     sortOrder: index,
                   })),
                 },
@@ -1077,6 +1365,12 @@ class TripService {
         timeout: DB_TRANSACTION_TIMEOUT_MS,
       }
     );
+
+    logger.info("TRIP_REGENERATE_PERSISTED", {
+      tripId,
+      userId,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
 
     return mapTripResponse(result);
   }
