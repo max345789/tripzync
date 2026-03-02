@@ -1127,6 +1127,7 @@ class TripService {
       total,
       limit: query.limit,
       offset: query.offset,
+      page: query.page,
     };
   }
 

@@ -219,11 +219,27 @@ export function validateUpdateTripRequest(payload: unknown): UpdateTripRequest {
 }
 
 export function validateListTripsQuery(query: ParsedQs): ListTripsQuery {
-  assertAllowedQueryKeys(query, ["limit", "offset"]);
+  assertAllowedQueryKeys(query, ["limit", "offset", "page"]);
   const limit = parsePositiveInteger(query.limit, "limit", DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-  const offset = parsePositiveInteger(query.offset, "offset", DEFAULT_LIST_OFFSET, 10_000);
+  const offset =
+    query.offset === undefined
+      ? DEFAULT_LIST_OFFSET
+      : parsePositiveInteger(query.offset, "offset", DEFAULT_LIST_OFFSET, 10_000);
+  const page =
+    query.page === undefined ? undefined : parsePositiveInteger(query.page, "page", 1, 10_000);
 
-  return { limit, offset };
+  if (page !== undefined && query.offset !== undefined) {
+    throw new AppError(400, "VALIDATION_ERROR", "Use either page or offset, not both.");
+  }
+
+  if (page !== undefined && page < 1) {
+    throw new AppError(400, "VALIDATION_ERROR", "page must be >= 1.");
+  }
+
+  const resolvedOffset = page !== undefined ? (page - 1) * limit : offset;
+  const resolvedPage = page ?? Math.floor(resolvedOffset / limit) + 1;
+
+  return { limit, offset: resolvedOffset, page: resolvedPage };
 }
 
 export function validateExploreQuery(query: ParsedQs): ExploreQuery {

@@ -27,6 +27,7 @@ export type UpdateTripRequest = {
 export type ListTripsQuery = {
   limit: number;
   offset: number;
+  page: number;
 };
 
 export type ExploreQuery = {
@@ -70,6 +71,7 @@ export type TripListResponse = {
   total: number;
   limit: number;
   offset: number;
+  page: number;
 };
 
 export type DeleteTripResponse = {

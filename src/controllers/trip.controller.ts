@@ -42,6 +42,7 @@ export const listTripsController = asyncHandler(async (req: Request, res: Respon
     total: result.total,
     limit: result.limit,
     offset: result.offset,
+    page: result.page,
   });
 });
 
