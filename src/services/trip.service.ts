@@ -41,9 +41,12 @@ const GOOGLE_API_LOOKUP_TIMEOUT_MS = 2_800;
 const GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT = "https://maps.googleapis.com/maps/api/place/textsearch/json";
 const GOOGLE_DISTANCE_MATRIX_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json";
 const GOOGLE_PLACE_PHOTO_ENDPOINT = "https://maps.googleapis.com/maps/api/place/photo";
+const WIKIMEDIA_API_ENDPOINT = "https://en.wikipedia.org/w/api.php";
 const DISTANCE_MATRIX_DESTINATION_LIMIT = 25;
 const EXPLORE_ENRICH_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const GOOGLE_PHOTO_CACHE_TTL_MS = 1000 * 60 * 60 * 24;
+const WIKIMEDIA_LOOKUP_TIMEOUT_MS = 2_200;
+const WIKIMEDIA_PHOTO_CACHE_TTL_MS = 1000 * 60 * 60 * 24;
 
 const PLACE_SEARCH_TERMS_BY_BUDGET: Record<BudgetTier, string[]> = {
   low: ["park", "museum", "market", "cafe", "viewpoint"],
@@ -135,6 +138,17 @@ type GoogleDistanceMatrixResponse = {
   }>;
 };
 
+type WikimediaSearchResponse = {
+  query?: {
+    pages?: Array<{
+      title?: string;
+      thumbnail?: {
+        source?: string;
+      };
+    }>;
+  };
+};
+
 type CacheEntry<T> = {
   value: T;
   expiresAt: number;
@@ -149,6 +163,7 @@ const anchorCache = new Map<string, CacheEntry<Anchor>>();
 const nearbyPlaceCache = new Map<string, CacheEntry<NearbyPlace[]>>();
 const exploreEnrichmentCache = new Map<string, CacheEntry<{ title: string; photoUrl?: string }>>();
 const googlePhotoCache = new Map<string, CacheEntry<string>>();
+const wikimediaPhotoCache = new Map<string, CacheEntry<{ url?: string }>>();
 
 const BUDGET_ACTIVITY_LIBRARY: Record<
   BudgetTier,
@@ -1070,8 +1085,62 @@ function roundOneDecimal(value: number): number {
 }
 
 function fallbackPlacePhotoUrl(title: string, location: string): string {
-  const query = encodeURIComponent(`${title} ${location} travel place`);
-  return `https://source.unsplash.com/1200x800/?${query}`;
+  const seed = encodeURIComponent(`${title}-${location}`.trim().toLowerCase().replace(/\s+/g, "-"));
+  return `https://picsum.photos/seed/${seed}/1200/800`;
+}
+
+async function resolveWikimediaPhotoUrl(title: string, location: string): Promise<string | undefined> {
+  const cacheKey = `${title.toLowerCase()}|${location.toLowerCase()}`;
+  const cached = getCachedValue(wikimediaPhotoCache, cacheKey);
+  if (cached) {
+    return cached.url;
+  }
+
+  const queries = [`${title} ${location}`, title, `${location} landmark`];
+
+  for (const candidate of queries) {
+    const query = candidate.trim();
+    if (!query) {
+      continue;
+    }
+
+    const params = new URLSearchParams({
+      action: "query",
+      generator: "search",
+      gsrsearch: query,
+      gsrlimit: "1",
+      prop: "pageimages",
+      piprop: "thumbnail",
+      pithumbsize: "1200",
+      format: "json",
+      formatversion: "2",
+    });
+
+    const response = await fetchJsonWithTimeout<WikimediaSearchResponse>(
+      `${WIKIMEDIA_API_ENDPOINT}?${params.toString()}`,
+      {
+        headers: {
+          "User-Agent": HTTP_USER_AGENT,
+          Accept: "application/json",
+        },
+      },
+      WIKIMEDIA_LOOKUP_TIMEOUT_MS
+    );
+
+    const photoUrl = response?.query?.pages?.[0]?.thumbnail?.source?.trim();
+    if (photoUrl) {
+      setCachedValue(wikimediaPhotoCache, cacheKey, { url: photoUrl }, WIKIMEDIA_PHOTO_CACHE_TTL_MS);
+      return photoUrl;
+    }
+  }
+
+  setCachedValue(wikimediaPhotoCache, cacheKey, { url: undefined }, WIKIMEDIA_PHOTO_CACHE_TTL_MS);
+  return undefined;
+}
+
+async function resolveBestFallbackPhotoUrl(title: string, location: string): Promise<string> {
+  const wikiPhotoUrl = await resolveWikimediaPhotoUrl(title, location);
+  return wikiPhotoUrl ?? fallbackPlacePhotoUrl(title, location);
 }
 
 async function resolveGooglePhotoRedirectUrl(photoReference: string): Promise<string | undefined> {
@@ -1124,19 +1193,25 @@ async function resolveGooglePhotoRedirectUrl(photoReference: string): Promise<st
 
 async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<ExploreSpotSeed> {
   if (!env.googleMapsApiKey) {
+    const fallbackPhotoUrl =
+      spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(spot.title, spot.location));
+
     return {
       ...spot,
-      photoUrl: spot.photoUrl ?? fallbackPlacePhotoUrl(spot.title, spot.location),
+      photoUrl: fallbackPhotoUrl,
     };
   }
 
   const cacheKey = `${spot.title.toLowerCase()}|${spot.location.toLowerCase()}`;
   const cached = getCachedValue(exploreEnrichmentCache, cacheKey);
   if (cached) {
+    const fallbackPhotoUrl =
+      spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(cached.title, spot.location));
+
     return {
       ...spot,
       title: cached.title,
-      photoUrl: cached.photoUrl ?? spot.photoUrl ?? fallbackPlacePhotoUrl(spot.title, spot.location),
+      photoUrl: cached.photoUrl ?? fallbackPhotoUrl,
     };
   }
 
@@ -1163,7 +1238,9 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
   const photoReference =
     typeof match?.photos?.[0]?.photo_reference === "string" ? match.photos[0].photo_reference.trim() : "";
   const googlePhotoUrl = photoReference ? await resolveGooglePhotoRedirectUrl(photoReference) : undefined;
-  const photoUrl = googlePhotoUrl ?? spot.photoUrl ?? fallbackPlacePhotoUrl(matchedTitle, spot.location);
+  const fallbackPhotoUrl =
+    spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(matchedTitle, spot.location));
+  const photoUrl = googlePhotoUrl ?? fallbackPhotoUrl;
 
   setCachedValue(
     exploreEnrichmentCache,
