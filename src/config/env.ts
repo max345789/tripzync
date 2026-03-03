@@ -128,6 +128,19 @@ export const env = {
   googleClientId,
   appleClientId,
   googleMapsApiKey: parseOptionalSecret(process.env.GOOGLE_MAPS_API_KEY),
+  exploreLowCostMode: parseBoolean(process.env.EXPLORE_LOW_COST_MODE, true),
+  exploreGoogleEnrichEnabled: parseBoolean(process.env.EXPLORE_GOOGLE_ENRICH_ENABLED, true),
+  exploreGoogleMaxEnrichedPerRequest: parsePositiveInteger(
+    process.env.EXPLORE_GOOGLE_MAX_ENRICHED_PER_REQUEST,
+    2,
+    "EXPLORE_GOOGLE_MAX_ENRICHED_PER_REQUEST"
+  ),
+  exploreGoogleDailyRequestCap: parsePositiveInteger(
+    process.env.EXPLORE_GOOGLE_DAILY_REQUEST_CAP,
+    500,
+    "EXPLORE_GOOGLE_DAILY_REQUEST_CAP"
+  ),
+  exploreGoogleDistanceEnabled: parseBoolean(process.env.EXPLORE_GOOGLE_DISTANCE_ENABLED, false),
   openaiApiKey: parseOptionalSecret(process.env.OPENAI_API_KEY),
   openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
   openaiTimeoutMs: parsePositiveInteger(process.env.OPENAI_TIMEOUT_MS, 11_000, "OPENAI_TIMEOUT_MS"),

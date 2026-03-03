@@ -169,6 +169,11 @@ type CacheEntry<T> = {
   expiresAt: number;
 };
 
+type DailyGoogleUsage = {
+  dayKey: string;
+  requestsUsed: number;
+};
+
 type ExploreSpotSeed = ExploreSpotDTO & {
   originLatitude?: number;
   originLongitude?: number;
@@ -182,6 +187,10 @@ const exploreEnrichmentCache = new Map<
 >();
 const googlePhotoCache = new Map<string, CacheEntry<string>>();
 const wikimediaPhotoCache = new Map<string, CacheEntry<{ url?: string }>>();
+const googleUsage: DailyGoogleUsage = {
+  dayKey: "",
+  requestsUsed: 0,
+};
 
 const BUDGET_ACTIVITY_LIBRARY: Record<
   BudgetTier,
@@ -1102,6 +1111,51 @@ function roundOneDecimal(value: number): number {
   return Math.round(value * 10) / 10;
 }
 
+function utcDayKey(date = new Date()): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function tryReserveGoogleRequest(units: number, scope: string): boolean {
+  const dayKey = utcDayKey();
+  if (googleUsage.dayKey !== dayKey) {
+    googleUsage.dayKey = dayKey;
+    googleUsage.requestsUsed = 0;
+  }
+
+  if (googleUsage.requestsUsed + units > env.exploreGoogleDailyRequestCap) {
+    logger.warn("GOOGLE_REQUEST_CAP_REACHED", {
+      dayKey,
+      scope,
+      requestsUsed: googleUsage.requestsUsed,
+      requestCap: env.exploreGoogleDailyRequestCap,
+    });
+    return false;
+  }
+
+  googleUsage.requestsUsed += units;
+  return true;
+}
+
+function allowGoogleEnrichmentForSpot(index: number): boolean {
+  if (!env.googleMapsApiKey || !env.exploreGoogleEnrichEnabled) {
+    return false;
+  }
+
+  if (env.exploreLowCostMode) {
+    return index < env.exploreGoogleMaxEnrichedPerRequest;
+  }
+
+  return true;
+}
+
+async function enrichSpotWithoutGoogle(spot: ExploreSpotSeed): Promise<ExploreSpotSeed> {
+  const fallbackPhotoUrl = spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(spot.title, spot.location));
+  return {
+    ...spot,
+    photoUrl: fallbackPhotoUrl,
+  };
+}
+
 function fallbackPlacePhotoUrl(title: string, location: string): string {
   const seed = encodeURIComponent(`${title}-${location}`.trim().toLowerCase().replace(/\s+/g, "-"));
   return `https://picsum.photos/seed/${seed}/1200/800`;
@@ -1181,6 +1235,10 @@ async function resolveGooglePhotoRedirectUrl(photoReference: string): Promise<st
   const timeout = setTimeout(() => controller.abort(), GOOGLE_API_LOOKUP_TIMEOUT_MS);
 
   try {
+    if (!tryReserveGoogleRequest(1, "place_photo")) {
+      return undefined;
+    }
+
     const response = await fetch(`${GOOGLE_PLACE_PHOTO_ENDPOINT}?${params.toString()}`, {
       method: "GET",
       redirect: "manual",
@@ -1211,13 +1269,7 @@ async function resolveGooglePhotoRedirectUrl(photoReference: string): Promise<st
 
 async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<ExploreSpotSeed> {
   if (!env.googleMapsApiKey) {
-    const fallbackPhotoUrl =
-      spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(spot.title, spot.location));
-
-    return {
-      ...spot,
-      photoUrl: fallbackPhotoUrl,
-    };
+    return enrichSpotWithoutGoogle(spot);
   }
 
   const cacheKey = `${spot.title.toLowerCase()}|${spot.location.toLowerCase()}`;
@@ -1244,20 +1296,8 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
     nearbyParams.set("keyword", spot.title.trim());
   }
 
-  let nearbyResponse = await fetchJsonWithTimeout<GooglePlacesNearbySearchResponse>(
-    `${GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT}?${nearbyParams.toString()}`,
-    {
-      headers: {
-        "User-Agent": HTTP_USER_AGENT,
-        Accept: "application/json",
-      },
-    },
-    GOOGLE_API_LOOKUP_TIMEOUT_MS
-  );
-
-  let nearbyMatch = nearbyResponse?.results?.[0];
-  if (!nearbyMatch && nearbyParams.has("keyword")) {
-    nearbyParams.delete("keyword");
+  let nearbyResponse: GooglePlacesNearbySearchResponse | null = null;
+  if (tryReserveGoogleRequest(1, "nearby_search")) {
     nearbyResponse = await fetchJsonWithTimeout<GooglePlacesNearbySearchResponse>(
       `${GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT}?${nearbyParams.toString()}`,
       {
@@ -1268,6 +1308,23 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
       },
       GOOGLE_API_LOOKUP_TIMEOUT_MS
     );
+  }
+
+  let nearbyMatch = nearbyResponse?.results?.[0];
+  if (!nearbyMatch && nearbyParams.has("keyword")) {
+    nearbyParams.delete("keyword");
+    if (tryReserveGoogleRequest(1, "nearby_search_retry")) {
+      nearbyResponse = await fetchJsonWithTimeout<GooglePlacesNearbySearchResponse>(
+        `${GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT}?${nearbyParams.toString()}`,
+        {
+          headers: {
+            "User-Agent": HTTP_USER_AGENT,
+            Accept: "application/json",
+          },
+        },
+        GOOGLE_API_LOOKUP_TIMEOUT_MS
+      );
+    }
     nearbyMatch = nearbyResponse?.results?.[0];
   }
 
@@ -1310,6 +1367,10 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
     radius: "6000",
     key: env.googleMapsApiKey,
   });
+
+  if (!tryReserveGoogleRequest(1, "text_search")) {
+    return enrichSpotWithoutGoogle(spot);
+  }
 
   const response = await fetchJsonWithTimeout<GooglePlacesTextSearchResponse>(
     `${GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT}?${params.toString()}`,
@@ -1376,7 +1437,11 @@ async function applyGoogleDistanceMatrix(spots: ExploreSpotSeed[]): Promise<Expl
     return spot;
   });
 
-  if (!env.googleMapsApiKey) {
+  if (
+    !env.googleMapsApiKey ||
+    !env.exploreGoogleDistanceEnabled ||
+    env.exploreLowCostMode
+  ) {
     return withFallback;
   }
 
@@ -1407,6 +1472,10 @@ async function applyGoogleDistanceMatrix(spots: ExploreSpotSeed[]): Promise<Expl
         units: "metric",
         key: env.googleMapsApiKey,
       });
+
+      if (!tryReserveGoogleRequest(1, "distance_matrix")) {
+        continue;
+      }
 
       const response = await fetchJsonWithTimeout<GoogleDistanceMatrixResponse>(
         `${GOOGLE_DISTANCE_MATRIX_ENDPOINT}?${params.toString()}`,
@@ -1679,7 +1748,11 @@ class TripService {
       return [];
     }
 
-    const placeEnriched = await Promise.all(spots.map((spot) => enrichSpotFromGooglePlaces(spot)));
+    const placeEnriched = await Promise.all(
+      spots.map((spot, index) =>
+        allowGoogleEnrichmentForSpot(index) ? enrichSpotFromGooglePlaces(spot) : enrichSpotWithoutGoogle(spot)
+      )
+    );
     const withDistance = await applyGoogleDistanceMatrix(placeEnriched);
 
     return withDistance.map(({ originLatitude: _originLatitude, originLongitude: _originLongitude, ...spot }) => spot);
