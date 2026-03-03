@@ -99,5 +99,7 @@ export type ExploreSpotDTO = {
   longitude: number;
   distanceKm?: number;
   photoUrl?: string;
+  address?: string;
+  placeId?: string;
   source: "trip_history" | "fallback";
 };

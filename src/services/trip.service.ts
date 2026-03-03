@@ -39,6 +39,7 @@ const GENERATION_HARD_TIMEOUT_MS = 8_500;
 const AI_PHASE_TIMEOUT_MS = 3_000;
 const GOOGLE_API_LOOKUP_TIMEOUT_MS = 2_800;
 const GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT = "https://maps.googleapis.com/maps/api/place/textsearch/json";
+const GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT = "https://maps.googleapis.com/maps/api/place/nearbysearch/json";
 const GOOGLE_DISTANCE_MATRIX_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json";
 const GOOGLE_PLACE_PHOTO_ENDPOINT = "https://maps.googleapis.com/maps/api/place/photo";
 const WIKIMEDIA_API_ENDPOINT = "https://en.wikipedia.org/w/api.php";
@@ -119,6 +120,20 @@ type GooglePlacesTextSearchResponse = {
   results?: Array<{
     name?: string;
     formatted_address?: string;
+    place_id?: string;
+    photos?: Array<{
+      photo_reference?: string;
+    }>;
+  }>;
+};
+
+type GooglePlacesNearbySearchResponse = {
+  status?: string;
+  error_message?: string;
+  results?: Array<{
+    name?: string;
+    vicinity?: string;
+    place_id?: string;
     photos?: Array<{
       photo_reference?: string;
     }>;
@@ -161,7 +176,10 @@ type ExploreSpotSeed = ExploreSpotDTO & {
 
 const anchorCache = new Map<string, CacheEntry<Anchor>>();
 const nearbyPlaceCache = new Map<string, CacheEntry<NearbyPlace[]>>();
-const exploreEnrichmentCache = new Map<string, CacheEntry<{ title: string; photoUrl?: string }>>();
+const exploreEnrichmentCache = new Map<
+  string,
+  CacheEntry<{ title: string; photoUrl?: string; address?: string; placeId?: string }>
+>();
 const googlePhotoCache = new Map<string, CacheEntry<string>>();
 const wikimediaPhotoCache = new Map<string, CacheEntry<{ url?: string }>>();
 
@@ -1212,6 +1230,77 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
       ...spot,
       title: cached.title,
       photoUrl: cached.photoUrl ?? fallbackPhotoUrl,
+      address: cached.address,
+      placeId: cached.placeId,
+    };
+  }
+
+  const nearbyParams = new URLSearchParams({
+    location: `${spot.latitude},${spot.longitude}`,
+    radius: "1800",
+    key: env.googleMapsApiKey,
+  });
+  if (spot.title.trim().length >= 3) {
+    nearbyParams.set("keyword", spot.title.trim());
+  }
+
+  let nearbyResponse = await fetchJsonWithTimeout<GooglePlacesNearbySearchResponse>(
+    `${GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT}?${nearbyParams.toString()}`,
+    {
+      headers: {
+        "User-Agent": HTTP_USER_AGENT,
+        Accept: "application/json",
+      },
+    },
+    GOOGLE_API_LOOKUP_TIMEOUT_MS
+  );
+
+  let nearbyMatch = nearbyResponse?.results?.[0];
+  if (!nearbyMatch && nearbyParams.has("keyword")) {
+    nearbyParams.delete("keyword");
+    nearbyResponse = await fetchJsonWithTimeout<GooglePlacesNearbySearchResponse>(
+      `${GOOGLE_PLACES_NEARBY_SEARCH_ENDPOINT}?${nearbyParams.toString()}`,
+      {
+        headers: {
+          "User-Agent": HTTP_USER_AGENT,
+          Accept: "application/json",
+        },
+      },
+      GOOGLE_API_LOOKUP_TIMEOUT_MS
+    );
+    nearbyMatch = nearbyResponse?.results?.[0];
+  }
+
+  if (nearbyMatch?.name?.trim()) {
+    const matchedTitle = toTitleCase(nearbyMatch.name);
+    const photoReference =
+      typeof nearbyMatch.photos?.[0]?.photo_reference === "string"
+        ? nearbyMatch.photos[0].photo_reference.trim()
+        : "";
+    const googlePhotoUrl = photoReference ? await resolveGooglePhotoRedirectUrl(photoReference) : undefined;
+    const fallbackPhotoUrl = spot.photoUrl?.trim() || (await resolveBestFallbackPhotoUrl(matchedTitle, spot.location));
+    const photoUrl = googlePhotoUrl ?? fallbackPhotoUrl;
+    const address = nearbyMatch.vicinity?.trim() || undefined;
+    const placeId = nearbyMatch.place_id?.trim() || undefined;
+
+    setCachedValue(
+      exploreEnrichmentCache,
+      cacheKey,
+      {
+        title: matchedTitle,
+        photoUrl,
+        address,
+        placeId,
+      },
+      EXPLORE_ENRICH_CACHE_TTL_MS
+    );
+
+    return {
+      ...spot,
+      title: matchedTitle,
+      photoUrl,
+      address,
+      placeId,
     };
   }
 
@@ -1235,6 +1324,8 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
 
   const match = response?.results?.[0];
   const matchedTitle = typeof match?.name === "string" && match.name.trim() ? toTitleCase(match.name) : spot.title;
+  const address = typeof match?.formatted_address === "string" ? match.formatted_address.trim() || undefined : undefined;
+  const placeId = typeof match?.place_id === "string" ? match.place_id.trim() || undefined : undefined;
   const photoReference =
     typeof match?.photos?.[0]?.photo_reference === "string" ? match.photos[0].photo_reference.trim() : "";
   const googlePhotoUrl = photoReference ? await resolveGooglePhotoRedirectUrl(photoReference) : undefined;
@@ -1248,6 +1339,8 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
     {
       title: matchedTitle,
       photoUrl,
+      address,
+      placeId,
     },
     EXPLORE_ENRICH_CACHE_TTL_MS
   );
@@ -1256,6 +1349,8 @@ async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<Explor
     ...spot,
     title: matchedTitle,
     photoUrl,
+    address,
+    placeId,
   };
 }
 
