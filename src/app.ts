@@ -46,7 +46,11 @@ if (env.nodeEnv === "development") {
 }
 
 app.get("/health", (_req, res) => {
-  return sendSuccess(res, { status: "ok", environment: env.nodeEnv });
+  return sendSuccess(res, {
+    status: "ok",
+    environment: env.nodeEnv,
+    deployCommit: env.deployCommit,
+  });
 });
 
 app.use("/", legalRoutes);

@@ -145,4 +145,9 @@ export const env = {
   openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
   openaiTimeoutMs: parsePositiveInteger(process.env.OPENAI_TIMEOUT_MS, 11_000, "OPENAI_TIMEOUT_MS"),
   tripzyncApiKey: process.env.TRIPZYNC_API_KEY?.trim() || undefined,
+  deployCommit:
+    process.env.RENDER_GIT_COMMIT?.trim() ||
+    process.env.GIT_COMMIT?.trim() ||
+    process.env.COMMIT_SHA?.trim() ||
+    undefined,
 } as const;
