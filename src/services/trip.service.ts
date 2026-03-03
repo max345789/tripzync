@@ -1438,6 +1438,15 @@ class TripService {
 
     outer:
     for (const trip of trips) {
+      const firstActivity = trip.itineraryDays
+        .slice()
+        .sort((a, b) => a.dayNumber - b.dayNumber)[0]
+        ?.activities.slice()
+        .sort((a, b) => a.sortOrder - b.sortOrder)[0];
+
+      const destinationOriginLatitude = firstActivity?.latitude ?? trip.startLatitude ?? undefined;
+      const destinationOriginLongitude = firstActivity?.longitude ?? trip.startLongitude ?? undefined;
+
       for (const day of trip.itineraryDays) {
         for (const activity of day.activities) {
           const key = `${activity.title.toLowerCase()}-${activity.latitude.toFixed(4)}-${activity.longitude.toFixed(4)}`;
@@ -1460,8 +1469,8 @@ class TripService {
             location,
             latitude: activity.latitude,
             longitude: activity.longitude,
-            originLatitude: trip.startLatitude ?? undefined,
-            originLongitude: trip.startLongitude ?? undefined,
+            originLatitude: destinationOriginLatitude,
+            originLongitude: destinationOriginLongitude,
             source: "trip_history",
           });
 
