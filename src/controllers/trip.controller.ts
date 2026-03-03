@@ -22,9 +22,11 @@ function authUserId(req: Request): string {
 
 export const generateTripController = asyncHandler(async (req: Request, res: Response) => {
   const payload = validateGenerateTripRequest(req.body);
-  const trip = await tripService.generateTrip(payload, authUserId(req));
+  const trip = req.auth?.userId
+    ? await tripService.generateTrip(payload, req.auth.userId)
+    : await tripService.previewTrip(payload);
 
-  return sendSuccess(res, trip, 201);
+  return sendSuccess(res, trip, req.auth?.userId ? 201 : 200);
 });
 
 export const getTripByIdController = asyncHandler(async (req: Request, res: Response) => {

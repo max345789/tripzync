@@ -66,6 +66,17 @@ export type TripDTO = {
   itinerary: ItineraryDayDTO[];
 };
 
+export type TripPreviewDTO = {
+  preview: true;
+  destination: string;
+  startCity: string;
+  startLatitude: number;
+  startLongitude: number;
+  days: number;
+  budget: BudgetTier;
+  itinerary: ItineraryDayDTO[];
+};
+
 export type TripListResponse = {
   items: TripDTO[];
   total: number;
@@ -86,5 +97,7 @@ export type ExploreSpotDTO = {
   location: string;
   latitude: number;
   longitude: number;
+  distanceKm?: number;
+  photoUrl?: string;
   source: "trip_history" | "fallback";
 };

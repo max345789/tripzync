@@ -1,4 +1,5 @@
 import { Prisma } from "@prisma/client";
+import { ZodError } from "zod";
 import { NextFunction, Request, Response } from "express";
 import { env } from "../config/env";
 import { ApiError } from "../types/api";
@@ -41,6 +42,9 @@ export function errorMiddleware(
     appError = new AppError(400, "VALIDATION_ERROR", "Invalid database query.");
   } else if (err instanceof Prisma.PrismaClientInitializationError) {
     appError = new AppError(503, "DATABASE_UNAVAILABLE", "Failed to initialize database connection.");
+  } else if (err instanceof ZodError) {
+    const zErr = err as ZodError;
+    appError = new AppError(400, "VALIDATION_ERROR", zErr.issues[0].message, zErr.format());
   } else if (err instanceof Error) {
     appError = new AppError(
       500,

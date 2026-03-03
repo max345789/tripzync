@@ -86,7 +86,7 @@ if (jwtRefreshSecret.length < 16) {
   throw new Error("JWT_REFRESH_SECRET must be at least 16 characters.");
 }
 
-const socialAuthEnabled = parseBoolean(process.env.SOCIAL_AUTH_ENABLED, true);
+const socialAuthEnabled = parseBoolean(process.env.SOCIAL_AUTH_ENABLED, false);
 const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim() || undefined;
 const appleClientId = process.env.APPLE_CLIENT_ID?.trim() || undefined;
 
@@ -127,6 +127,7 @@ export const env = {
   socialAuthEnabled,
   googleClientId,
   appleClientId,
+  googleMapsApiKey: parseOptionalSecret(process.env.GOOGLE_MAPS_API_KEY),
   openaiApiKey: parseOptionalSecret(process.env.OPENAI_API_KEY),
   openaiModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
   openaiTimeoutMs: parsePositiveInteger(process.env.OPENAI_TIMEOUT_MS, 11_000, "OPENAI_TIMEOUT_MS"),

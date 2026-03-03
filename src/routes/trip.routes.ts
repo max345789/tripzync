@@ -9,7 +9,7 @@ import {
   updateTripController,
 } from "../controllers/trip.controller";
 import { env } from "../config/env";
-import { requireAuth } from "../middlewares/auth.middleware";
+import { optionalAuth, requireAuth } from "../middlewares/auth.middleware";
 import { createRateLimitMiddleware } from "../middlewares/rate-limit.middleware";
 
 const router = Router();
@@ -19,8 +19,9 @@ const tripGenerationLimiter = createRateLimitMiddleware({
   message: "Too many trip generation requests. Please retry shortly.",
 });
 
+router.post("/generate-trip", optionalAuth, tripGenerationLimiter, generateTripController);
+
 router.use(requireAuth);
-router.post("/generate-trip", tripGenerationLimiter, generateTripController);
 router.get("/explore", exploreController);
 router.get("/trip/:id", getTripByIdController);
 router.get("/trips", listTripsController);

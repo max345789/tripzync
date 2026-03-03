@@ -11,6 +11,7 @@ import {
   ListTripsQuery,
   RegenerateTripRequest,
   TripDTO,
+  TripPreviewDTO,
   TripListResponse,
   TravelMode,
   UpdateTripRequest,
@@ -36,6 +37,13 @@ const DB_TRANSACTION_MAX_WAIT_MS = 10_000;
 const DB_TRANSACTION_TIMEOUT_MS = 20_000;
 const GENERATION_HARD_TIMEOUT_MS = 8_500;
 const AI_PHASE_TIMEOUT_MS = 3_000;
+const GOOGLE_API_LOOKUP_TIMEOUT_MS = 2_800;
+const GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT = "https://maps.googleapis.com/maps/api/place/textsearch/json";
+const GOOGLE_DISTANCE_MATRIX_ENDPOINT = "https://maps.googleapis.com/maps/api/distancematrix/json";
+const GOOGLE_PLACE_PHOTO_ENDPOINT = "https://maps.googleapis.com/maps/api/place/photo";
+const DISTANCE_MATRIX_DESTINATION_LIMIT = 25;
+const EXPLORE_ENRICH_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const GOOGLE_PHOTO_CACHE_TTL_MS = 1000 * 60 * 60 * 24;
 
 const PLACE_SEARCH_TERMS_BY_BUDGET: Record<BudgetTier, string[]> = {
   low: ["park", "museum", "market", "cafe", "viewpoint"],
@@ -102,13 +110,45 @@ type OverpassResponse = {
   elements?: OverpassElement[];
 };
 
+type GooglePlacesTextSearchResponse = {
+  status?: string;
+  error_message?: string;
+  results?: Array<{
+    name?: string;
+    formatted_address?: string;
+    photos?: Array<{
+      photo_reference?: string;
+    }>;
+  }>;
+};
+
+type GoogleDistanceMatrixResponse = {
+  status?: string;
+  error_message?: string;
+  rows?: Array<{
+    elements?: Array<{
+      status?: string;
+      distance?: {
+        value?: number;
+      };
+    }>;
+  }>;
+};
+
 type CacheEntry<T> = {
   value: T;
   expiresAt: number;
 };
 
+type ExploreSpotSeed = ExploreSpotDTO & {
+  originLatitude?: number;
+  originLongitude?: number;
+};
+
 const anchorCache = new Map<string, CacheEntry<Anchor>>();
 const nearbyPlaceCache = new Map<string, CacheEntry<NearbyPlace[]>>();
+const exploreEnrichmentCache = new Map<string, CacheEntry<{ title: string; photoUrl?: string }>>();
+const googlePhotoCache = new Map<string, CacheEntry<string>>();
 
 const BUDGET_ACTIVITY_LIBRARY: Record<
   BudgetTier,
@@ -1012,6 +1052,232 @@ function toTitleCase(value: string): string {
     .join(" ");
 }
 
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  if (items.length === 0 || chunkSize <= 0) {
+    return [];
+  }
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+
+  return chunks;
+}
+
+function roundOneDecimal(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+function fallbackPlacePhotoUrl(title: string, location: string): string {
+  const query = encodeURIComponent(`${title} ${location} travel place`);
+  return `https://source.unsplash.com/1200x800/?${query}`;
+}
+
+async function resolveGooglePhotoRedirectUrl(photoReference: string): Promise<string | undefined> {
+  if (!env.googleMapsApiKey || !photoReference.trim()) {
+    return undefined;
+  }
+
+  const cached = getCachedValue(googlePhotoCache, photoReference);
+  if (cached) {
+    return cached;
+  }
+
+  const params = new URLSearchParams({
+    maxwidth: "1200",
+    photo_reference: photoReference,
+    key: env.googleMapsApiKey,
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GOOGLE_API_LOOKUP_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${GOOGLE_PLACE_PHOTO_ENDPOINT}?${params.toString()}`, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": HTTP_USER_AGENT,
+      },
+    });
+
+    const redirectedUrl = response.headers.get("location")?.trim();
+    if (redirectedUrl) {
+      setCachedValue(googlePhotoCache, photoReference, redirectedUrl, GOOGLE_PHOTO_CACHE_TTL_MS);
+      return redirectedUrl;
+    }
+
+    if (response.ok && response.url) {
+      setCachedValue(googlePhotoCache, photoReference, response.url, GOOGLE_PHOTO_CACHE_TTL_MS);
+      return response.url;
+    }
+  } catch {
+    // best effort
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  return undefined;
+}
+
+async function enrichSpotFromGooglePlaces(spot: ExploreSpotSeed): Promise<ExploreSpotSeed> {
+  if (!env.googleMapsApiKey) {
+    return {
+      ...spot,
+      photoUrl: spot.photoUrl ?? fallbackPlacePhotoUrl(spot.title, spot.location),
+    };
+  }
+
+  const cacheKey = `${spot.title.toLowerCase()}|${spot.location.toLowerCase()}`;
+  const cached = getCachedValue(exploreEnrichmentCache, cacheKey);
+  if (cached) {
+    return {
+      ...spot,
+      title: cached.title,
+      photoUrl: cached.photoUrl ?? spot.photoUrl ?? fallbackPlacePhotoUrl(spot.title, spot.location),
+    };
+  }
+
+  const params = new URLSearchParams({
+    query: `${spot.title} ${spot.location}`,
+    location: `${spot.latitude},${spot.longitude}`,
+    radius: "6000",
+    key: env.googleMapsApiKey,
+  });
+
+  const response = await fetchJsonWithTimeout<GooglePlacesTextSearchResponse>(
+    `${GOOGLE_PLACES_TEXT_SEARCH_ENDPOINT}?${params.toString()}`,
+    {
+      headers: {
+        "User-Agent": HTTP_USER_AGENT,
+        Accept: "application/json",
+      },
+    },
+    GOOGLE_API_LOOKUP_TIMEOUT_MS
+  );
+
+  const match = response?.results?.[0];
+  const matchedTitle = typeof match?.name === "string" && match.name.trim() ? toTitleCase(match.name) : spot.title;
+  const photoReference =
+    typeof match?.photos?.[0]?.photo_reference === "string" ? match.photos[0].photo_reference.trim() : "";
+  const googlePhotoUrl = photoReference ? await resolveGooglePhotoRedirectUrl(photoReference) : undefined;
+  const photoUrl = googlePhotoUrl ?? spot.photoUrl ?? fallbackPlacePhotoUrl(matchedTitle, spot.location);
+
+  setCachedValue(
+    exploreEnrichmentCache,
+    cacheKey,
+    {
+      title: matchedTitle,
+      photoUrl,
+    },
+    EXPLORE_ENRICH_CACHE_TTL_MS
+  );
+
+  return {
+    ...spot,
+    title: matchedTitle,
+    photoUrl,
+  };
+}
+
+async function applyGoogleDistanceMatrix(spots: ExploreSpotSeed[]): Promise<ExploreSpotSeed[]> {
+  const withFallback = spots.map((spot) => {
+    if (
+      Number.isFinite(spot.originLatitude) &&
+      Number.isFinite(spot.originLongitude)
+    ) {
+      return {
+        ...spot,
+        distanceKm: roundOneDecimal(
+          haversineKm(
+            spot.originLatitude as number,
+            spot.originLongitude as number,
+            spot.latitude,
+            spot.longitude
+          )
+        ),
+      };
+    }
+
+    return spot;
+  });
+
+  if (!env.googleMapsApiKey) {
+    return withFallback;
+  }
+
+  const groupedByOrigin = new Map<string, Array<{ index: number; spot: ExploreSpotSeed }>>();
+  withFallback.forEach((spot, index) => {
+    if (!Number.isFinite(spot.originLatitude) || !Number.isFinite(spot.originLongitude)) {
+      return;
+    }
+
+    const key = `${(spot.originLatitude as number).toFixed(6)},${(spot.originLongitude as number).toFixed(6)}`;
+    const existing = groupedByOrigin.get(key) ?? [];
+    existing.push({ index, spot });
+    groupedByOrigin.set(key, existing);
+  });
+
+  for (const [originKey, entries] of groupedByOrigin.entries()) {
+    const chunks = chunkArray(entries, DISTANCE_MATRIX_DESTINATION_LIMIT);
+
+    for (const chunk of chunks) {
+      const destinations = chunk
+        .map(({ spot }) => `${spot.latitude},${spot.longitude}`)
+        .join("|");
+
+      const params = new URLSearchParams({
+        origins: originKey,
+        destinations,
+        mode: "driving",
+        units: "metric",
+        key: env.googleMapsApiKey,
+      });
+
+      const response = await fetchJsonWithTimeout<GoogleDistanceMatrixResponse>(
+        `${GOOGLE_DISTANCE_MATRIX_ENDPOINT}?${params.toString()}`,
+        {
+          headers: {
+            "User-Agent": HTTP_USER_AGENT,
+            Accept: "application/json",
+          },
+        },
+        GOOGLE_API_LOOKUP_TIMEOUT_MS
+      );
+
+      const elements = response?.rows?.[0]?.elements;
+      if (!elements || !Array.isArray(elements)) {
+        continue;
+      }
+
+      elements.forEach((element, index) => {
+        if (!element || element.status !== "OK") {
+          return;
+        }
+
+        const meters = element.distance?.value;
+        if (!Number.isFinite(meters)) {
+          return;
+        }
+
+        const target = chunk[index];
+        if (!target) {
+          return;
+        }
+
+        withFallback[target.index] = {
+          ...withFallback[target.index],
+          distanceKm: roundOneDecimal((meters as number) / 1000),
+        };
+      });
+    }
+  }
+
+  return withFallback;
+}
+
 const EXPLORE_FALLBACKS: Array<{ title: string; subtitle: string; location: string }> = [
   { title: "Hidden City Walk", subtitle: "Hidden Gems", location: "Old Town" },
   { title: "Local Flavor Route", subtitle: "Food", location: "Market District" },
@@ -1021,6 +1287,33 @@ const EXPLORE_FALLBACKS: Array<{ title: string; subtitle: string; location: stri
 ];
 
 class TripService {
+  async previewTrip(input: GenerateTripRequest): Promise<TripPreviewDTO> {
+    const startTime = Date.now();
+    const startCity = (input.startCity ?? input.destination).trim();
+    const { itinerary, fallbackUsed } = await buildItinerary(input.destination, input.days, input.budget);
+    const startAnchor =
+      (await withTimeout(resolveAnchorFromDestination(startCity), 1_800)) ?? resolveAnchor(startCity);
+
+    logger.info("TRIP_PREVIEW_COMPLETED", {
+      destination: input.destination,
+      days: input.days,
+      budget: input.budget,
+      elapsedMs: Date.now() - startTime,
+      fallbackUsed,
+    });
+
+    return {
+      preview: true,
+      destination: input.destination,
+      startCity,
+      startLatitude: startAnchor.latitude,
+      startLongitude: startAnchor.longitude,
+      days: input.days,
+      budget: input.budget,
+      itinerary,
+    };
+  }
+
   async generateTrip(input: GenerateTripRequest, userId: string): Promise<TripDTO> {
     const startTime = Date.now();
     const startCity = (input.startCity ?? input.destination).trim();
@@ -1140,9 +1433,10 @@ class TripService {
     });
 
     const search = query.q?.trim().toLowerCase();
-    const spots: ExploreSpotDTO[] = [];
+    const spots: ExploreSpotSeed[] = [];
     const seen = new Set<string>();
 
+    outer:
     for (const trip of trips) {
       for (const day of trip.itineraryDays) {
         for (const activity of day.activities) {
@@ -1166,11 +1460,13 @@ class TripService {
             location,
             latitude: activity.latitude,
             longitude: activity.longitude,
+            originLatitude: trip.startLatitude ?? undefined,
+            originLongitude: trip.startLongitude ?? undefined,
             source: "trip_history",
           });
 
           if (spots.length >= query.limit) {
-            return spots;
+            break outer;
           }
         }
       }
@@ -1198,7 +1494,14 @@ class TripService {
       });
     }
 
-    return spots;
+    if (!spots.length) {
+      return [];
+    }
+
+    const placeEnriched = await Promise.all(spots.map((spot) => enrichSpotFromGooglePlaces(spot)));
+    const withDistance = await applyGoogleDistanceMatrix(placeEnriched);
+
+    return withDistance.map(({ originLatitude: _originLatitude, originLongitude: _originLongitude, ...spot }) => spot);
   }
 
   async updateTrip(tripId: string, payload: UpdateTripRequest, userId: string): Promise<TripDTO> {

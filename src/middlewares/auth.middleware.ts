@@ -20,6 +20,40 @@ function readBearerToken(header: string | undefined): string {
   return token.trim();
 }
 
+export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
+  const header = req.headers.authorization;
+  if (!header) {
+    next();
+    return;
+  }
+
+  try {
+    const token = readBearerToken(header);
+    const decoded = jwt.verify(token, env.jwtSecret) as AccessTokenPayload;
+    const userId = typeof decoded.sub === "string" ? decoded.sub : "";
+    const email = typeof decoded.email === "string" ? decoded.email : "";
+
+    if (!userId || !email) {
+      throw new AppError(401, "UNAUTHORIZED", "Invalid access token payload.");
+    }
+
+    req.auth = { userId, email };
+    next();
+  } catch (error) {
+    if (error instanceof AppError) {
+      next(error);
+      return;
+    }
+
+    if (error instanceof jwt.TokenExpiredError || error instanceof jwt.JsonWebTokenError) {
+      next(new AppError(401, "UNAUTHORIZED", "Invalid or expired access token."));
+      return;
+    }
+
+    next(new AppError(401, "UNAUTHORIZED", "Unauthorized."));
+  }
+}
+
 export function requireAuth(req: Request, _res: Response, next: NextFunction): void {
   try {
     const token = readBearerToken(req.headers.authorization);
